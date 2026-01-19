@@ -1,0 +1,43 @@
+# Cursor/VSCode editor specific
+.cursor/
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Large data files (like trained models)
+# Git is not great at handling large files.
+# It's better to add them here and download them separately.
+*.pt
+*.pth
+*.h5
+*.ckpt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment variables
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.log
+*.tmp
+*.temp
