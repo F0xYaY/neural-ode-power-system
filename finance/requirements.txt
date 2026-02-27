@@ -1,0 +1,26 @@
+# 同花顺 MCP 服务器依赖
+# 安装命令: pip install -r requirements.txt
+
+# 股票数据获取库（免费，无需 API key）
+akshare>=1.12.0
+pandas>=2.0.0
+
+# 可视化库
+matplotlib>=3.5.0
+seaborn>=0.12.0
+
+# 深度学习框架
+torch>=2.0.0
+torchsde>=0.2.6
+
+# 机器学习库
+scikit-learn>=1.0.0
+
+# 量化交易框架
+lib-pybroker>=1.2.0
+
+# 数据库
+# SQLite3 是 Python 标准库，无需安装
+
+# 如果需要使用 tushare（需要注册获取 token）
+# tushare>=1.2.89

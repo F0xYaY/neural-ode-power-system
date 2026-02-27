@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from typing import Optional
 
 
 class PowerSystemPhysics(nn.Module):
@@ -66,13 +67,30 @@ class DynamicsNetwork(nn.Module):
     - 使用 ResNetBlock 和 ELU 激活改善梯度流
     - 正交权重初始化
     """
-    def __init__(self, hidden_dim=128, num_layers=4, activation='tanh', use_spectral_norm=True):
+    def __init__(
+        self,
+        input_dim: int = 2,
+        hidden_dim: int = 128,
+        num_layers: int = 4,
+        activation: str = "tanh",
+        use_spectral_norm: bool = True,
+        angle_encoding: Optional[bool] = None,
+        n_angles: Optional[int] = None,
+    ):
         super().__init__()
         layers = []
-        
-        # 输入层：输入维度从 2 变为 3 (sin(delta), cos(delta), omega)
-        input_dim = 3
-        linear1 = nn.Linear(input_dim, hidden_dim)
+
+        # 兼容旧行为：2 维 SMIB 默认启用 sin/cos 编码
+        if angle_encoding is None:
+            angle_encoding = (input_dim == 2)
+        if angle_encoding and n_angles is None:
+            n_angles = 1 if input_dim == 2 else input_dim // 2
+        if not angle_encoding:
+            n_angles = 0
+
+        feature_dim = int(input_dim + (n_angles or 0))
+
+        linear1 = nn.Linear(feature_dim, hidden_dim)
         # 强制使用谱归一化（限制 Lipschitz 常数，防止数值不稳定）
         linear1 = nn.utils.spectral_norm(linear1)
         layers.append(linear1)
@@ -94,7 +112,7 @@ class DynamicsNetwork(nn.Module):
         
         # 输出层：关键！使用极小的初始化（near-zero initialization）
         # 这确保初始向量场接近平坦 (dx/dt ≈ 0)，避免 dt underflow
-        output_layer = nn.Linear(hidden_dim, 2)
+        output_layer = nn.Linear(hidden_dim, input_dim)
         # 输出层也使用谱归一化
         output_layer = nn.utils.spectral_norm(output_layer)
         
@@ -110,6 +128,9 @@ class DynamicsNetwork(nn.Module):
         layers.append(output_layer)
         
         self.net = nn.Sequential(*layers)
+        self.input_dim = int(input_dim)
+        self.angle_encoding = bool(angle_encoding)
+        self.n_angles = int(n_angles or 0)
     
     def forward(self, t, y):
         """
@@ -126,36 +147,31 @@ class DynamicsNetwork(nn.Module):
         Returns:
             dy/dt: derivative of the state vector, shape (batch_size, 2)
         """
-        # 三角编码：提取 delta 和 omega，然后编码
-        delta = y[..., 0]  # 功角
-        omega = y[..., 1]  # 频率
-        
-        # 创建特征向量：[sin(delta), cos(delta), omega]
-        # 这样网络可以更容易学习 d_omega ∝ sin(delta) 的关系
-        features = torch.cat([
-            torch.sin(delta).unsqueeze(-1),
-            torch.cos(delta).unsqueeze(-1),
-            omega.unsqueeze(-1)
-        ], dim=-1)
-        
-        return self.net(features)
+        if self.angle_encoding and self.n_angles > 0:
+            angles = y[..., : self.n_angles]
+            rest = y[..., self.n_angles :]
+            features = torch.cat([torch.sin(angles), torch.cos(angles), rest], dim=-1)
+            return self.net(features)
+        return self.net(y)
 
 
 class LyapunovNet(nn.Module):
     """Lyapunov 函数网络 V(x)"""
-    def __init__(self, hidden_dim=64, epsilon=1e-3):
+    def __init__(self, input_dim: int = 2, hidden_dim: int = 64, epsilon: float = 1e-3):
         """
         Args:
+            input_dim: 状态维度
             hidden_dim: 隐藏层维度
             epsilon: 正则化系数（从 0.1 减小到 1e-3，允许学习复杂的非二次能量函数形状）
         """
         super().__init__()
         self.epsilon = epsilon
         self.net = nn.Sequential(
-            nn.Linear(2, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, 1)  # 输出标量能量值
         )
+        self.input_dim = int(input_dim)
 
     def forward(self, x):
         """
@@ -165,6 +181,53 @@ class LyapunovNet(nn.Module):
         """
         output = self.net(x) ** 2 
         return output + self.epsilon * (x**2).sum(dim=1, keepdim=True)
+
+
+class ICNNLyapunovNet(nn.Module):
+    """
+    ICNN（Input Convex Neural Network）变体的 Lyapunov 网络。
+
+    说明：
+    - ICNN 保证对输入 x 的凸性（通过对 z 连接权重施加非负约束）。
+    - 为保证 V(0)=0 且 V(x)>0：使用 V(x)=softplus(f(x)-f(0)) + eps*||x||^2
+    """
+
+    def __init__(self, input_dim: int, hidden_dims=(256, 256, 256, 256), epsilon: float = 1e-3):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.epsilon = float(epsilon)
+
+        hidden_dims = tuple(int(h) for h in hidden_dims)
+        self.Wx = nn.ModuleList()
+        self.Wz_raw = nn.ParameterList()
+        self.b = nn.ParameterList()
+
+        # 第一层：仅 x -> z
+        self.Wx.append(nn.Linear(self.input_dim, hidden_dims[0], bias=True))
+        # 后续层：x -> z_k 与 z_{k-1} -> z_k（z 权重非负）
+        for k in range(1, len(hidden_dims)):
+            self.Wx.append(nn.Linear(self.input_dim, hidden_dims[k], bias=False))
+            wz = torch.empty(hidden_dims[k], hidden_dims[k - 1])
+            nn.init.normal_(wz, mean=0.0, std=0.02)
+            self.Wz_raw.append(nn.Parameter(wz))
+            self.b.append(nn.Parameter(torch.zeros(hidden_dims[k])))
+
+        self.out = nn.Linear(hidden_dims[-1], 1, bias=True)
+        self.act = nn.Softplus()
+
+    def _forward_raw(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.act(self.Wx[0](x))
+        for k in range(1, len(self.Wx)):
+            Wz_pos = torch.nn.functional.softplus(self.Wz_raw[k - 1])  # 非负约束
+            z = self.act(self.Wx[k](x) + (z @ Wz_pos.t()) + self.b[k - 1])
+        return self.out(z)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        f_x = self._forward_raw(x)
+        with torch.no_grad():
+            f_0 = self._forward_raw(torch.zeros_like(x))
+        v = torch.nn.functional.softplus(f_x - f_0)
+        return v + self.epsilon * (x**2).sum(dim=1, keepdim=True)
 
 
 def get_lie_derivative(V_net, f_net, x):
