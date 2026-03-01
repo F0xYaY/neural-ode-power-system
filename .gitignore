@@ -9,9 +9,11 @@ __pycache__/
 *.pyd
 .Python
 
+# 数据集与大数据文件 (避免超过 GitHub 100MB 限制)
+*.npy
+*.csv
+
 # Large data files (like trained models)
-# Git is not great at handling large files.
-# It's better to add them here and download them separately.
 *.pt
 *.pth
 *.h5
